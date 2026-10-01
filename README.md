@@ -80,6 +80,92 @@ Runs at **http://localhost:5173** and talks to the API at `localhost:5000`
    manage coupons at `/admin/coupons`, and view the sales dashboard at
    `/admin`.
 
+## New features (v10 - real-time notifications via WebSockets)
+
+Needs a database migration AND two new Python packages:
+
+```powershell
+Get-Content backend/migrate_v5.sql | mysql -u root -p ecommerce
+pip install flask-socketio eventlet
+cd frontend
+npm install socket.io-client
+```
+
+**Note:** `eventlet` prints a deprecation warning on import these days (its
+maintainers are steering people toward other async libraries). It still
+works fine and is what the task specifically asks for - the warning is
+expected and harmless for this project.
+
+**Also note:** the backend now starts with `socketio.run(...)` instead of
+`app.run(...)`, with `use_reloader=False`. Flask's auto-reload-on-save
+doesn't play well with eventlet's process model, so you'll need to
+manually restart `python app.py` after editing backend code from now on.
+
+- When a customer places an order, every admin gets a live notification -
+  no refresh needed - via a persistent WebSocket connection
+  (Flask-SocketIO + socket.io-client).
+- New `notifications` table, new `SocketContext` (`src/context/SocketContext.jsx`)
+  and a bell icon with a dropdown (`src/components/NotificationBell.jsx`) in
+  the Navbar, for any logged-in user.
+- Four new REST routes so notifications persist across refreshes:
+  `GET /api/notifications`, `PUT /api/notifications/<id>/read`,
+  `PUT /api/notifications/read-all`, `DELETE /api/notifications/<id>`.
+- **Security fix vs. the original task spec:** the spec's design has the
+  client tell the server its own role in a `join` message after connecting
+  (`socket.emit('join', { user_id, role })`) - which means any logged-in
+  customer could simply claim `role: 'admin'` and silently receive every
+  order notification (including other customers' order totals). Instead,
+  the socket connection is authenticated with the same JWT access token
+  already used for REST calls (sent as `{ auth: { token } }` when opening
+  the connection); the server decodes it and joins rooms based on what the
+  token actually says, never what the client claims. There's no `join`
+  event at all - it's redundant once the server does this at connect time.
+  This is covered by an automated test that proves a customer spoofing
+  `role: 'admin'` gets nothing.
+- **Fix vs. the spec's sample code:** the spec's own `markAsRead` only
+  updated local React state and never called the backend - so a page
+  refresh would silently un-read everything. It's now a real `PUT` to
+  `/api/notifications/<id>/read`. Likewise, order notifications are
+  inserted one row per admin (not a single bulk `INSERT...SELECT`) so each
+  admin's live notification carries their own real database id from the
+  moment it arrives - meaning they can mark it read or dismiss it
+  immediately, with no need to wait for a refresh to "reconcile" a
+  placeholder id.
+- `unreadCount` is derived from the notification list (`useMemo`) rather
+  than tracked as a separate incrementing counter, so it can never drift
+  out of sync after a delete or a bulk mark-all-read.
+- All four REST routes scope every query to the logged-in user's own id,
+  so one user can never read, mark-read, or delete another user's
+  notification by guessing an id.
+- Dropping a notification (the × button) only deletes it - it does not
+  also mark it read first, so dismissing something you haven't looked at
+  doesn't pretend you read it.
+
+## New features (v9 - profile page upgrades)
+
+No database migration needed - these reuse the orders/users tables as they are.
+
+- **"Member since" now shows month + year** ("Member since Jan 2025"), not
+  the full date.
+- **Account Activity section** - new `GET /api/me/stats` returns the user's
+  total order count and total amount spent (cancelled orders excluded from
+  the spend total). Shown as two stat cards, reusing the same card styles
+  as the admin dashboard.
+- **Delete Account** - a "Danger Zone" section with a confirm modal
+  (`components/ConfirmModal.jsx`, reusable, closes on Cancel/Escape/backdrop
+  click). Confirming calls the new `DELETE /api/me`, then clears the JWTs
+  and redirects home.
+  - Backend design choice: this is a **hard delete**. It removes the
+    user's orders (and their order_items, which cascade automatically),
+    then the user row itself (which cascades to ratings and wishlist, since
+    those already had `ON DELETE CASCADE`). Their avatar file is deleted
+    from disk too. If you'd rather keep order history for accounting/legal
+    reasons, replace this with an "anonymize" step instead of a real delete.
+- **Password strength meter** under the New Password field - a 5-point
+  score (length, length bonus, mixed case, digit, symbol) shown as a
+  coloured bar + label (Weak/Fair/Good/Strong/Very Strong). It's a UI hint
+  only; the backend's actual rule is still just the 6-character minimum.
+
 ## New features (v8 - user profile & settings)
 
 Needs a one-line database migration - run it BEFORE starting the new backend:

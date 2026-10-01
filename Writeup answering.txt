@@ -1,106 +1,253 @@
-1. How does your Navbar update immediately after a name or avatar change without a page refresh? 
-Explain which React concept makes this possible.
 
-The React concept is shared state through AuthContext.
+1.What is the difference between HTTP and WebSocket communication? Draw the flow of each in text/arrows.
 
-The flow is:
+HTTP:
 
-AuthContext stores the currently logged-in user's information, such as name and avatar_url.
+HTTP follows a request-response model. The client sends a request, the server responds, and that communication is 
+generally finished.
 
-Navbar reads that user information from AuthContext.
+Client
+  │
+  │  HTTP Request
+  ▼
+Server
+  │
+  │  HTTP Response
+  ▼
+Client
+  │
+  └── Connection/request completed
 
-When the profile page successfully updates the name/avatar, it calls updateUser().
+For example, when the customer places an order:
 
-updateUser() updates the user state inside AuthContext.
+React
+  │
+  │ POST /api/orders
+  ▼
+Flask
+  │
+  │ Save order
+  │
+  │ Response
+  ▼
+React
 
-Because React re-renders components when their state/context changes, the Navbar automatically receives the new data and re-renders.
+The server cannot normally send a new message to the React application later unless the client makes another request.
 
-So, there is no need to refresh the page.
+WebSocket / Socket.IO:
 
-In simple terms:
+WebSocket communication keeps a persistent connection open. Both the client and server can send events whenever needed.
 
-ProfilePage
-    ↓
-updateUser()
-    ↓
-AuthContext user state changes
-    ↓
-React re-renders components using that context
-    ↓
-Navbar shows new name/avatar
+React                         Flask
+  │                             │
+  │──── Connect ───────────────►│
+  │◄──── Connection open ───────│
+  │                             │
+  │──── Event ─────────────────►│
+  │◄──── Event ─────────────────│
+  │                             │
+  │◄──── New notification ──────│
+  │                             │
+  │──── Event ─────────────────►│
+  │                             │
+  └──────── Persistent connection
 
-The key concept is React Context + state updates + re-rendering.
+In my project:
 
+Customer places order
+        │
+        ▼
+Flask saves order
+        │
+        ▼
+Flask emits new_notification
+        │
+        ▼
+Admin's React app
+        │
+        ▼
+Notification appears instantly
 
-2.Why do you verify the current password before allowing a change? What security risk does skipping this step create?
-
-You verify the current password to make sure that the person requesting the password change actually knows the existing password.
-
-For example, suppose someone gets access to a user's logged-in session or token. Without checking the current password, they could potentially do:
-
-PUT /api/me/password
-        ↓
-Set a new password
-        ↓
-Original user can no longer log in
-
-That creates a serious account takeover/security risk.
-
-The current-password check adds another authentication factor for this sensitive operation:
-
-if not bcrypt.check_password_hash(
-    user['password'], current
-):
-    return jsonify({
-        "error": "Current password incorrect"
-    }), 401
-
-So even if someone has the user's authenticated session, they still need to know the existing password to change it.
-
-3.Your password change route returns 401 for wrong current password. Why 401 and not 400?
-
-401 Unauthorized is appropriate because the request failed an authentication/credential check.
-
-The distinction is:
-
-400 Bad Request → The request itself is invalid, such as missing data or passwords not matching.
-
-new_password != confirm_password
-→ 400
-
-401 Unauthorized → The supplied authentication credentials are invalid.
-
-current_password is incorrect
-→ 401
-
-In this task, the user's current password is being used to verify their identity before performing a sensitive operation. Therefore, a wrong current password is treated as an authentication failure.
+Main difference: HTTP is primarily request → response, while WebSockets allow continuous two-way communication.
 
 
-4. What is the purpose of the updateUser function you added to AuthContext?
+2.What is a Socket.IO room and why did you use one for admin users instead of broadcasting to everyone?
 
-updateUser provides a central way to update the logged-in user's information throughout the React application.
+A Socket.IO room is a logical group of connected clients. A socket can join a room, and the server can send an event 
+specifically to that room.
 
-For example, after changing the name:
+In my application, admin join:
 
-updateUser({
-  name: "Ravi Kumar",
-  email: "ravi@example.com"
-});
+admin
 
-Or after uploading an avatar:
+When an admin connects:
 
-updateUser({
-  avatar_url: "/static/uploads/new-avatar.jpg"
-});
+Admin 1 ──┐
+Admin 2 ──┼──► "admins" room
+Admin 3 ──┘
 
-Because the user data is stored in AuthContext, components such as:
+When a new order is created, the backend does:
 
-Navbar
+socketio.emit(
+    'new_notification',
+    notification_data,
+    room='admins'
+)
 
-ProfilePage
+The event is therefore delivered to the connected sockets in the admins room.
 
-other authenticated components
+Why not broadcast to everyone?
+If you broadcast to everyone:
 
-can immediately see the updated information.
+New order
+   │
+   ├──► Admin
+   ├──► Customer A ❌
+   ├──► Customer B ❌
+   └──► Customer C ❌
 
-Without updateUser, you might update the database successfully but still have the old user information in React state until the page is refreshed or the user logs in again.
+Customers would receive an admin-specific notification.
+
+With the admin room:
+
+New order
+   │
+   ▼
+admins room
+   ├──► Admin 1
+   ├──► Admin 2
+   └──► Admin 3
+
+So the room provides targeted communication and avoids sending irrelevant or potentially sensitive notifications to other users.
+
+
+3.When a user refreshes the page,the socket disconnects and reconnects.How do previously saved notifications still appear in the bell dropdown?
+
+The WebSocket connection itself does not preserve the notification data.
+
+When the user refreshes:
+
+Browser refresh
+      │
+      ▼
+Old Socket.IO connection closes
+      │
+      ▼
+React creates a new connection
+      │
+      ▼
+User joins their room again
+
+However, my notifications were also saved permanently in the notifications database table.
+
+When NotificationBell mounts, it calls:
+
+GET /api/notifications
+
+The backend retrieves the user's saved notifications from the database:
+
+Database
+   │
+   │ SELECT notifications
+   ▼
+GET /api/notifications
+   │
+   ▼
+React
+   │
+   ▼
+NotificationBell
+
+Therefore, there are two mechanisms:
+
+Database + REST API → preserves notification history across refreshes.
+
+Socket.IO → delivers new notifications instantly while the application is open.
+
+For example:
+
+Before refresh:
+Database
+ └── New order #123
+
+After refresh:
+GET /api/notifications
+ └──► React loads order #123
+       └──► Bell displays it
+
+This is why notifications don't disappear just because the WebSocket connection was temporarily disconnected.
+
+
+4.What does socketio.emit() do versus emit() inside a @socketio.on() handler? What is the difference?
+
+Both are used to send Socket.IO events, but they are used in different contexts.
+
+emit() inside @socketio.on()
+For example:
+
+@socketio.on('join')
+def on_join(data):
+    join_room('admins')
+    emit('joined', {'room': 'admins'})
+
+Here, emit() is the contextual emit. It is used inside a Socket.IO event handler and is commonly used to respond to the 
+client/event that triggered the handler.
+
+Conceptually:
+
+Client
+  │
+  │ join event
+  ▼
+@socketio.on('join')
+  │
+  │ emit()
+  ▼
+Client
+
+socketio.emit()
+This is called on the SocketIO server instance:
+
+socketio.emit(
+    'new_notification',
+    {
+        'message': 'New order #123 placed',
+        'type': 'order',
+        'order_id': 123
+    },
+    room='admins'
+)
+
+It is useful when the server needs to emit an event from application code, such as your order creation route, rather than simply responding to the currently handled socket event.
+
+my flow is:
+
+Customer
+   │
+   │ POST /api/orders
+   ▼
+Flask order route
+   │
+   ├── Save order
+   ├── Save notification
+   │
+   └── socketio.emit()
+             │
+             ▼
+        admins room
+             │
+       ┌─────┼─────┐
+       ▼     ▼     ▼
+    Admin 1 Admin 2 Admin 3
+
+Simple way to remember:
+
+emit()	                                                        socketio.emit()
+
+*Usually used inside a Socket.IO event handler	                Can be used from general application code
+*Contextual to the current Socket.IO event	                Uses the SocketIO server instance
+*Useful for responding to socket events	                        Useful for application-triggered events
+*Example: join → joined	                                        Example: order created → new_notification
+
+For my project: socketio.emit() is appropriate in the POST /api/orders route because an HTTP order request triggers a 
+Socket.IO notification to the admin room.

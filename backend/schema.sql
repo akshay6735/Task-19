@@ -1,6 +1,7 @@
 CREATE DATABASE IF NOT EXISTS ecommerce;
 USE ecommerce;
 
+DROP TABLE IF EXISTS notifications;
 DROP TABLE IF EXISTS product_images;
 DROP TABLE IF EXISTS ratings;
 DROP TABLE IF EXISTS wishlist;
@@ -102,4 +103,15 @@ CREATE TABLE coupons (
 INSERT INTO coupons (code, discount_percent, active, expires_at) VALUES
     ('WELCOME10', 10, TRUE, NULL),
     ('SAVE20', 20, TRUE, '2026-12-31');
+
+CREATE TABLE notifications (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT NOT NULL,
+    message     VARCHAR(255) NOT NULL,
+    type        ENUM('order','info','alert') DEFAULT 'info',
+    is_read     BOOLEAN DEFAULT FALSE,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 

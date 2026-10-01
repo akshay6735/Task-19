@@ -4,6 +4,7 @@ import { useCart } from '../context/CartContext'
 import { useWishlist } from '../context/WishlistContext'
 import { useTheme } from '../context/ThemeContext'
 import Avatar from './Avatar'
+import NotificationBell from './NotificationBell'
 
 const NEXT_THEME = { light: 'dark', dark: 'sepia', sepia: 'light' }
 const THEME_ICON = { light: '🌙', dark: '📜', sepia: '☀️' } // icon shown = the theme you'll switch TO
@@ -58,6 +59,8 @@ export default function Navbar() {
         >
           {THEME_ICON[theme]}
         </button>
+
+        {user && <NotificationBell />}
 
         {user ? (
           <div className="navbar-user">

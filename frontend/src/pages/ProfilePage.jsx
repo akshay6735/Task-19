@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import api from '../api'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import { useForm } from '../hooks/useForm'
 import Avatar from '../components/Avatar'
+import ConfirmModal from '../components/ConfirmModal'
 
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024 // matches the backend's 2 MB limit
 const ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/webp']
@@ -25,14 +27,50 @@ function validatePassword(values) {
   return errors
 }
 
-// "2025-01-15" -> "January 15, 2025". Built from parts (not new Date("2025-01-15"))
-// so timezones can't shift the date by a day.
+// "2025-01-15" -> "Jan 2025". Built from parts (not new Date("2025-01-15"))
+// so timezones can't shift the date to the previous/next month.
 function formatMemberSince(isoDate) {
   if (!isoDate) return ''
-  const [y, m, d] = isoDate.split('-').map(Number)
-  return new Date(y, m - 1, d).toLocaleDateString(undefined, {
-    year: 'numeric', month: 'long', day: 'numeric',
+  const [y, m] = isoDate.split('-').map(Number)
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, {
+    year: 'numeric', month: 'short',
   })
+}
+
+// A simple 5-point score: the length requirement, a longer length bonus,
+// mixed case, a digit, and a symbol. Purely a helpful nudge for the user -
+// the backend's only real rule is the 6-character minimum.
+function getPasswordStrength(password) {
+  if (!password) return { percent: 0, label: '', level: '' }
+  if (password.length < 6) return { percent: 12, label: 'Too short', level: 'weak' }
+
+  let score = 1 // meets the minimum length
+  if (password.length >= 10) score++
+  if (/[a-z]/.test(password) && /[A-Z]/.test(password)) score++
+  if (/\d/.test(password)) score++
+  if (/[^A-Za-z0-9]/.test(password)) score++
+
+  const byScore = {
+    1: { label: 'Weak', level: 'weak' },
+    2: { label: 'Fair', level: 'fair' },
+    3: { label: 'Good', level: 'good' },
+    4: { label: 'Strong', level: 'strong' },
+    5: { label: 'Very Strong', level: 'strong' },
+  }
+  return { percent: (score / 5) * 100, ...byScore[score] }
+}
+
+function PasswordStrengthMeter({ password }) {
+  const { percent, label, level } = getPasswordStrength(password)
+  if (!password) return null
+  return (
+    <div className="password-strength" aria-live="polite">
+      <div className="password-strength-track">
+        <div className={`password-strength-fill password-strength-${level}`} style={{ width: `${percent}%` }} />
+      </div>
+      <span className={`password-strength-label password-strength-label-${level}`}>{label}</span>
+    </div>
+  )
 }
 
 function Field({ label, name, type = 'text', value, onChange, error, autoComplete }) {
@@ -56,12 +94,21 @@ function Field({ label, name, type = 'text', value, onChange, error, autoComplet
 }
 
 export default function ProfilePage() {
-  const { user, updateUser } = useAuth()
+  const { user, updateUser, logout } = useAuth()
   const { showToast } = useToast()
+  const navigate = useNavigate()
 
   const [profile, setProfile] = useState(null) // full record from GET /api/me
   const [loadError, setLoadError] = useState('')
   const [reloadKey, setReloadKey] = useState(0)
+
+  // ---------- activity summary ----------
+  const [stats, setStats] = useState(null)
+  const [statsError, setStatsError] = useState('')
+
+  // ---------- delete account ----------
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [deleting, setDeleting] = useState(false)
 
   const profileForm = useForm({ name: '', email: '' }, validateProfile)
   const passwordForm = useForm(
@@ -86,6 +133,29 @@ export default function ProfilePage() {
       })
     return () => { cancelled = true }
   }, [reloadKey, setProfileValues, updateUser])
+
+  useEffect(() => {
+    let cancelled = false
+    api.get('/me/stats')
+      .then(res => { if (!cancelled) setStats(res.data) })
+      .catch(() => { if (!cancelled) setStatsError('Could not load your activity summary.') })
+    return () => { cancelled = true }
+  }, [])
+
+  // ---------- delete account ----------
+  async function handleDeleteAccount() {
+    setDeleting(true)
+    try {
+      await api.delete('/me')
+      await logout()
+      navigate('/')
+    } catch (err) {
+      setShowDeleteModal(false)
+      showToast(err.response?.data?.error || 'Could not delete your account. Try again.', 'error')
+    } finally {
+      setDeleting(false)
+    }
+  }
 
   // ---------- Section 1: profile picture ----------
   const fileInputRef = useRef(null)
@@ -298,6 +368,7 @@ export default function ProfilePage() {
               onChange={passwordForm.handleChange}
               error={passwordForm.errors.new_password}
             />
+            <PasswordStrengthMeter password={passwordForm.values.new_password} />
             <Field
               label="Confirm New Password" name="confirm_password" type="password"
               autoComplete="new-password"
@@ -310,7 +381,51 @@ export default function ProfilePage() {
             </button>
           </form>
         </section>
+
+        {/* Account activity summary */}
+        <section className="profile-card">
+          <h2>Account Activity</h2>
+          {statsError ? (
+            <p className="error-text">{statsError}</p>
+          ) : !stats ? (
+            <p className="form-hint">Loading activity...</p>
+          ) : (
+            <div className="stat-grid">
+              <div className="stat-card stat-card-orders">
+                <div className="stat-label">Total Orders</div>
+                <div className="stat-value">{stats.total_orders}</div>
+              </div>
+              <div className="stat-card stat-card-revenue">
+                <div className="stat-label">Total Spent</div>
+                <div className="stat-value">${stats.total_spent.toFixed(2)}</div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* Danger zone - delete account */}
+        <section className="profile-card danger-zone">
+          <h2>Danger Zone</h2>
+          <p className="form-hint">
+            Deleting your account permanently removes your profile, order history,
+            ratings and wishlist. This cannot be undone.
+          </p>
+          <button type="button" className="btn btn-danger" onClick={() => setShowDeleteModal(true)}>
+            Delete Account
+          </button>
+        </section>
       </div>
+
+      <ConfirmModal
+        open={showDeleteModal}
+        title="Delete your account?"
+        message="This permanently deletes your profile, order history, ratings and wishlist. This action cannot be undone."
+        confirmLabel="Yes, Delete My Account"
+        danger
+        loading={deleting}
+        onConfirm={handleDeleteAccount}
+        onCancel={() => setShowDeleteModal(false)}
+      />
     </div>
   )
 }

@@ -1,13 +1,21 @@
+# eventlet.monkey_patch() MUST run before anything else is imported - including
+# mysql.connector - so every socket/thread those libraries open underneath is
+# the non-blocking eventlet version. Importing it late is a common source of
+# WebSocket connections that mysteriously hang.
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import uuid
-from datetime import timedelta
+from datetime import timedelta, datetime
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import (
     JWTManager, create_access_token, create_refresh_token,
-    jwt_required, get_jwt_identity, get_jwt,
+    jwt_required, get_jwt_identity, get_jwt, decode_token,
 )
+from flask_socketio import SocketIO, join_room
 import mysql.connector
 from werkzeug.utils import secure_filename
 from functools import wraps
@@ -36,6 +44,52 @@ def handle_expired_token(jwt_header, jwt_payload):
 # CORS preflight does need to be told that an Authorization header is allowed
 CORS(app, origins=["http://localhost:5173"], allow_headers=["Content-Type", "Authorization"])
 bcrypt = Bcrypt(app)
+
+# ------------------------------------------------------------------
+# SocketIO - real-time notifications
+# ------------------------------------------------------------------
+socketio = SocketIO(app, cors_allowed_origins=["http://localhost:5173"], async_mode="eventlet")
+
+# sid -> {"user_id": str, "role": str}, for the current process only. Good
+# enough for one dev server; a multi-process deployment would need a shared
+# store (e.g. Redis) instead of this plain dict.
+connected_users = {}
+
+
+@socketio.on("connect")
+def on_connect(auth):
+    """
+    Authenticates the socket using the SAME access token already used for
+    REST calls (sent as `{ auth: { token } }` when the client opens the
+    connection) and joins rooms based on what the token actually says -
+    not based on anything the client claims in a message after connecting.
+    A client-sent 'join' event with a self-reported role would let anyone
+    claim role: 'admin' and silently read other people's order volume.
+    """
+    token = (auth or {}).get("token")
+    if not token:
+        return False  # reject the connection - no anonymous sockets
+
+    try:
+        decoded = decode_token(token)
+    except Exception:
+        return False  # missing/expired/invalid token - reject
+
+    user_id = decoded["sub"]
+    role = decoded.get("role")
+    connected_users[request.sid] = {"user_id": user_id, "role": role}
+
+    join_room(f"user_{user_id}")
+    if role == "admin":
+        join_room("admins")
+
+    print(f"Client connected: {request.sid} (user {user_id}, role {role})")
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    info = connected_users.pop(request.sid, None)
+    print(f"Client disconnected: {request.sid} (was user {info['user_id']})" if info else f"Client disconnected: {request.sid}")
 
 # ------------------------------------------------------------------
 # Image upload config
@@ -353,6 +407,72 @@ def update_avatar():
         db.rollback()
         delete_uploaded_file(new_url)  # don't leave an orphaned file behind
         return jsonify({"error": "Could not update profile picture", "detail": str(e)}), 500
+    finally:
+        cur.close()
+        db.close()
+
+
+@app.route("/api/me/stats", methods=["GET"])
+@jwt_required()
+def my_account_stats():
+    """Total orders placed and total spent, for the profile page's activity summary."""
+    user_id = get_jwt_identity()
+
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    try:
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total_orders,
+                COALESCE(SUM(CASE WHEN status != 'Cancelled' THEN total_amount ELSE 0 END), 0) AS total_spent
+            FROM orders
+            WHERE user_id = %s
+        """, (user_id,))
+        row = cur.fetchone()
+        return jsonify({
+            "total_orders": row["total_orders"],
+            "total_spent": float(row["total_spent"]),
+        })
+    finally:
+        cur.close()
+        db.close()
+
+
+@app.route("/api/me", methods=["DELETE"])
+@jwt_required()
+def delete_account():
+    """
+    Permanently deletes the logged-in user's own account.
+
+    Design choice: this is a hard delete, not an anonymize-and-keep-orders
+    approach some real stores use for accounting/legal reasons. Order
+    history is deleted along with the account. If you need to retain order
+    records for business reasons, replace this with an "anonymize" step
+    instead (blank out name/email, keep the orders rows).
+    """
+    user_id = get_jwt_identity()
+
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT avatar_url FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        # orders.user_id has no ON DELETE CASCADE in the schema, so orders (and
+        # their order_items, which DO cascade from orders) must be removed
+        # explicitly before the user row itself. ratings and wishlist already
+        # cascade from users, so deleting the user row cleans those up.
+        cur.execute("DELETE FROM orders WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        db.commit()
+
+        delete_uploaded_file(user["avatar_url"])
+        return jsonify({"message": "Account deleted"}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": "Could not delete account", "detail": str(e)}), 500
     finally:
         cur.close()
         db.close()
@@ -852,6 +972,38 @@ def create_order():
             )
 
         db.commit()
+
+        # --- Step 3: notify every admin, live, that a new order came in ---
+        # One INSERT per admin (not a single bulk INSERT...SELECT) so each
+        # admin gets their OWN row with a real id back immediately - letting
+        # the frontend mark it read/delete it right away, with no need to
+        # wait for a page refresh to reconcile a placeholder id.
+        customer_name = get_jwt().get("name", "A customer")
+        message = f"New order #{order_id} placed by {customer_name} — ${total:.2f}"
+
+        cur.execute("SELECT id FROM users WHERE role = 'admin'")
+        admin_ids = [row["id"] for row in cur.fetchall()]
+
+        notifications = []
+        for admin_id in admin_ids:
+            cur.execute(
+                "INSERT INTO notifications (user_id, message, type) VALUES (%s, %s, 'order')",
+                (admin_id, message),
+            )
+            notifications.append({"admin_id": admin_id, "notification_id": cur.lastrowid})
+        db.commit()
+
+        created_at = datetime.now().isoformat()
+        for n in notifications:
+            socketio.emit("new_notification", {
+                "id": n["notification_id"],
+                "message": message,
+                "type": "order",
+                "order_id": order_id,
+                "is_read": False,
+                "created_at": created_at,
+            }, room=f"user_{n['admin_id']}")
+
         return jsonify({
             "order_id": order_id,
             "subtotal": subtotal,
@@ -1135,5 +1287,90 @@ def admin_stats():
         db.close()
 
 
+# ------------------------------------------------------------------
+# Notification routes
+# ------------------------------------------------------------------
+@app.route("/api/notifications", methods=["GET"])
+@login_required
+def get_notifications():
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    try:
+        # capped at 50 - the dropdown only shows the latest 10 anyway, and an
+        # unbounded SELECT would only get slower as notifications pile up
+        cur.execute("""
+            SELECT id, message, type, is_read, created_at
+            FROM notifications
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT 50
+        """, (g.user_id,))
+        rows = cur.fetchall()
+        for row in rows:
+            row["created_at"] = row["created_at"].isoformat()
+        return jsonify(rows)
+    finally:
+        cur.close()
+        db.close()
+
+
+@app.route("/api/notifications/<int:notification_id>/read", methods=["PUT"])
+@login_required
+def mark_notification_read(notification_id):
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    try:
+        # scoped to g.user_id so one user can never mark/see another
+        # person's notification just by guessing an id
+        cur.execute(
+            "UPDATE notifications SET is_read = TRUE WHERE id = %s AND user_id = %s",
+            (notification_id, g.user_id),
+        )
+        db.commit()
+        if cur.rowcount == 0:
+            return jsonify({"error": "Notification not found"}), 404
+        return jsonify({"message": "Marked as read"})
+    finally:
+        cur.close()
+        db.close()
+
+
+@app.route("/api/notifications/read-all", methods=["PUT"])
+@login_required
+def mark_all_notifications_read():
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    try:
+        cur.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = %s", (g.user_id,))
+        db.commit()
+        return jsonify({"message": "All notifications marked as read"})
+    finally:
+        cur.close()
+        db.close()
+
+
+@app.route("/api/notifications/<int:notification_id>", methods=["DELETE"])
+@login_required
+def delete_notification(notification_id):
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "DELETE FROM notifications WHERE id = %s AND user_id = %s",
+            (notification_id, g.user_id),
+        )
+        db.commit()
+        if cur.rowcount == 0:
+            return jsonify({"error": "Notification not found"}), 404
+        return jsonify({"message": "Notification deleted"})
+    finally:
+        cur.close()
+        db.close()
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # use_reloader=False avoids a well-known Flask-SocketIO + eventlet quirk:
+    # Werkzeug's reloader spawns a second process that re-runs this whole
+    # module (monkey-patching eventlet a second time) and can leave the
+    # socket server in a half-started state. Restart manually after edits.
+    socketio.run(app, debug=True, port=5000, use_reloader=False)
